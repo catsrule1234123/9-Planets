@@ -94,6 +94,60 @@ def vwrap(s, width):
     lines.append(cur)
     return lines
 
+# ==================== COMMANDS SIDEBAR ====================
+# A reference list shown on the right side of wide terminals so players
+# always see the basic command vocabulary (mirrors Help page 1).
+SIDEBAR_COMMANDS = [
+    ("⬆️⬇️⬅️➡️",  "Move 1 tile"),
+    ("walk <name>", "Auto-path to resource"),
+    ("attack / a",  "Strike nearest animal"),
+    ("throw / t",   "Throw spear"),
+    ("gather",      "Collect at tile (-2⚡)"),
+    ("gather all",  "Collect whole cluster"),
+    ("inv",         "View inventory"),
+    ("eat <item>",  "Eat food"),
+    ("drink <item>","Drink water/liquid"),
+    ("craft <item>","Start crafting"),
+    ("cancel",      "Cancel current craft"),
+    ("inspect <x>", "Identify unknown item"),
+    ("identify <x>","Alias for inspect"),
+    ("recipes",     "Browse recipes"),
+    ("achievements","Progress & rewards"),
+    ("quests",      "Active quest log"),
+    ("shop",        "Browse shop prices"),
+    ("buy <item>",  "Buy from shop"),
+    ("sell <item>", "Sell to shop"),
+    ("equip <armor>","Wear/remove armor"),
+    ("rest",        "Toggle resting"),
+    ("trap set",    "Place trap here"),
+    ("trap check",  "Collect caught game"),
+    ("trap remove", "Retrieve a trap"),
+    ("trap list",   "Show active traps"),
+    ("pause",       "Pause/resume game"),
+    ("help",        "Open help menu"),
+    ("save",        "Save progress"),
+    ("quit",        "Exit game"),
+]
+
+def _build_commands_sidebar(width, height):
+    """Return up to `height` strings, each exactly `width` visual columns wide."""
+    if width < 12 or height < 3:
+        return [" " * width] * max(0, height)
+    title = "📜 COMMANDS"
+    lines = [vfit(title, width), vfit("─" * width, width)]
+    # Two-column layout inside the sidebar: cmd | desc
+    cmd_w = min(14, max(10, width // 2 - 1))
+    desc_w = width - cmd_w - 1
+    for cmd, desc in SIDEBAR_COMMANDS:
+        line = vfit(cmd, cmd_w) + " " + vfit(desc, desc_w)
+        lines.append(vfit(line, width))
+        if len(lines) >= height:
+            break
+    while len(lines) < height:
+        lines.append(" " * width)
+    return lines[:height]
+
+
 def vljust(s, width):
     """Space-pad string on right so visual width >= width (no truncation)."""
     s = str(s); gap = width - vlen(s)
@@ -1247,9 +1301,16 @@ def update_quests(player, weather, world, msg, term=None):
         complete("arctic_sales", "✅ QUEST COMPLETE: Arctic sales complete!", reward=None)
 
 
-def _temp_label(temp):
-    """Return a short temperature label for the HUD. Shows 'Freezing' only if actual cold damage occurs."""
-    if temp < TEMP_COLD_THRESH:    return "🥶❄️ Freezing"
+def _temp_label(temp, player=None):
+    """Return a short temperature label for the HUD. Shows 'Freezing' only if actual cold damage occurs.
+    If a player is given and they are NOT currently taking cold damage (sufficient insulation
+    or not in arctic), suppress the 'Freezing' label even if temp is technically low."""
+    cold_damaging = getattr(player, "_cold_damaging", False) if player is not None else True
+    if temp < TEMP_COLD_THRESH:
+        if cold_damaging:
+            return "🥶❄️ Freezing"
+        else:
+            return f"🧥 Insulated ({temp:.0f})"
     if temp <= 30:   return f"❄️ Cold ({temp:.0f})"
     if temp <= 65:   return f"😊 Comfy"
     if temp <= 80:   return f"🌡️ Warm ({temp:.0f})"
@@ -1912,7 +1973,10 @@ class Terminal:
         sys.stdout.write("\033[2J\033[H")
         try: cols, term_h = os.get_terminal_size()
         except: cols, term_h = TERM_WIDTH, 24
-        term_w = max(20, cols)  # Use full terminal width without capping
+        term_w = max(20, cols)  # Actual terminal width without capping
+        # Leave a safety margin so emoji-width differences between Python and
+        # the terminal cannot auto-wrap lines and scroll the top HUD off-screen.
+        draw_w = max(1, term_w - 8)
         if term_h < 3: term_h = 3
         # If caller didn't provide a proper HUD header (e.g. during overlays),
         # synthesize a minimal top HUD from `player` so stats/biome always show.
@@ -1925,32 +1989,32 @@ class Terminal:
                     dist_lbl = ('↗️' if dist_to_border(player.x, player.y) > 0 else '↙️') + str(abs(int(dist_to_border(player.x, player.y))))
                     h1 = f"{day_label} | 📍@({player.x},{player.y}) | {biome_label} | 🧭{dist_lbl}"
                     h2 = f"❤️{player.health:.0f} | 🍽️{player.hunger:.0f} | 💧{player.thirst:.0f} | ⚡{int(player.energy)} | 😴{int(player.fatigue)}"
-                    h3 = f"🪙{player.coins:.0f} | 📚{player.inventory.get('textbook',0)} | { _temp_label(player.temp) }"
+                    h3 = f"🪙{player.coins:.0f} | 📚{player.inventory.get('textbook',0)} | { _temp_label(player.temp, player) }"
                     header = [h1, h2, h3] + (header or [])
                 except Exception:
                     header = header or []
-        max_scan = max(0, term_h - (len(header) if header else 3) - 8)
-        scan = scan[:max_scan]
-        out = list(header)
-        out.append("─" * term_w)
-        out.extend(scan)
-        out.append("─" * term_w)
-        out.extend(msg[-3:])
-        out.append("")
+        # ---- Build the "bottom block" first (msg, status, prompt) so we can
+        # reserve the exact rows it needs and only ever drop scan/cluster rows
+        # to fit the terminal. This guarantees the HUD header and bottom info
+        # bars ALL stay visible at all times (including when paused). ----
+        bottom = []
+        bottom.append("─" * draw_w)
+        bottom.extend(msg[-3:])
+        bottom.append("")
         if player and player.active_tasks:
             t = player.active_tasks[0]
             if paused:
                 rem = t.get("paused_remaining", max(0, int(t["end"] - time.time())))
             else:
                 rem = max(0, int(t["end"] - time.time()))
-            out.append(f"🔨 Crafting: {t['item'].replace('_',' ').title()} ({rem}s) — movement locked")
+            bottom.append(f"🔨 Crafting: {t['item'].replace('_',' ').title()} ({rem}s) — movement locked")
         trap_status = ""
         if paused:
-            out.append("⏸️ GAME PAUSED — time, weather, and auto-walk are frozen until you resume.")
+            bottom.append("⏸️ GAME PAUSED — time, weather, and auto-walk are frozen until you resume.")
         elif player and player.resting:
             mode = "🔥 Campfire" if player.rest_mode == "campfire" else "😴 Floor"
             fuel = f" | 🪵{player.campfire_fuel} fuel left" if player.rest_mode == "campfire" else ""
-            out.append(f"{mode} REST active: +30😴/hr{fuel} — type 'rest' to stop")
+            bottom.append(f"{mode} REST active: +30😴/hr{fuel} — type 'rest' to stop")
         elif player and player.traps:
             setting = sum(1 for t in player.traps if t.get('status') == 'setting')
             caught  = sum(1 for t in player.traps if t.get('status') == 'caught')
@@ -1958,47 +2022,92 @@ class Terminal:
             if caught:  parts.append(f"🟢{caught} CAUGHT!")
             if setting: parts.append(f"⏳{setting} setting")
             trap_status = " | ".join(parts) if parts else ""
-        out.append(" " * term_w)
-        # Append trap status to prompt line if there are traps, to avoid overlay blocking
+        bottom.append(" " * draw_w)
+        # Prompt + buf
         prompt_with_trap = prompt
         if trap_status:
             prompt_with_trap = f"🪤 {trap_status} {prompt}"
-        # Ensure the typed buffer is visible: if the prompt is long, truncate it so at least
-        # one column is available for the buffer; otherwise show as much of the buffer as fits.
         buf_to_show = ""
         try:
             if vlen(buf) == 0:
                 prompt_disp = prompt_with_trap
                 buf_to_show = ""
             else:
-                avail = term_w - vlen(prompt_with_trap)
+                avail = draw_w - vlen(prompt_with_trap)
                 if avail <= 0:
-                    # Leave room for one char of buffer
-                    prompt_disp = vtrunc(prompt_with_trap, max(0, term_w - 1))
+                    prompt_disp = vtrunc(prompt_with_trap, max(0, draw_w - 1))
                     buf_to_show = vtrunc(buf[-15:], avail)
                 else:
                     prompt_disp = prompt_with_trap
                     buf_to_show = vtrunc(buf, avail)
         except Exception:
-            prompt_disp = prompt_with_trap; buf_to_show = vtrunc(buf, term_w)
-        out.append(f"{prompt_disp}{buf_to_show}")
-        while len(out) < term_h: out.append(" " * term_w)
+            prompt_disp = prompt_with_trap; buf_to_show = vtrunc(buf, draw_w)
+        bottom.append(f"{prompt_disp}{buf_to_show}")
+
+        # Reserve rows for header + separator + bottom; everything else is scan.
+        header_lines = list(header) if header else []
+        reserved = len(header_lines) + 1 + len(bottom)  # +1 = top separator
+        max_scan = max(0, term_h - reserved)
+        scan = scan[:max_scan]
+
+        out = list(header_lines)
+        out.append("─" * draw_w)
+        out.extend(scan)
+        out.extend(bottom)
+
+        # Pad if short
+        while len(out) < term_h:
+            # Insert padding just before the bottom block so the prompt stays at the last row
+            out.insert(len(out) - len(bottom), " " * draw_w)
+        # Last-resort trim: if header itself is taller than the terminal,
+        # keep the bottom prompt + as many header rows as possible.
         if len(out) > term_h:
-            header_len = len(header) + 1 if header else 1
-            if header_len >= term_h:
-                out = out[:term_h]
-            else:
-                tail_len = term_h - header_len
-                out = out[:header_len] + out[-tail_len:]
-        final = "\r\n".join([vfit(str(l), term_w) for l in out])
+            keep_bottom = bottom[-min(len(bottom), term_h):]
+            keep_header_n = max(0, term_h - len(keep_bottom))
+            out = (header_lines + ["─" * draw_w])[:keep_header_n] + keep_bottom
+        # ---- Right-side commands sidebar (wide terminals only) ----
+        sidebar_w = 0
+        sidebar_lines = []
+        if draw_w >= 100:
+            sidebar_w = min(40, max(28, draw_w // 4))
+            sidebar_lines = _build_commands_sidebar(sidebar_w, term_h)
+        if sidebar_w > 0:
+            sep = " │ "
+            main_w = draw_w - sidebar_w - vlen(sep)
+            # Header rows (HUD + top separator) get the FULL terminal width so
+            # long lines like "☀️ DAY | 📍@... | 🌲 Forest | 🧭↗️N" never get
+            # truncated or wrapped by the sidebar. The sidebar starts below.
+            header_rows = len(header_lines) + 1  # +1 for the top separator
+            # Rebuild the sidebar to fit only the rows below the header
+            side_rows = max(0, term_h - header_rows)
+            sidebar_lines = _build_commands_sidebar(sidebar_w, side_rows)
+            merged = []
+            for i, line in enumerate(out):
+                if i < header_rows:
+                    # Full-width HUD row, no sidebar overlay
+                    merged.append(vfit(str(line), draw_w))
+                else:
+                    j = i - header_rows
+                    left = vljust(vfit(str(line), main_w), main_w)
+                    right = sidebar_lines[j] if j < len(sidebar_lines) else (" " * sidebar_w)
+                    merged.append(left + sep + right)
+            out = merged
+        final = "\r\n".join([vtrunc(str(l), draw_w).rstrip() for l in out])
         sys.stdout.write(final + "\033[J")
+
+        # Repaint the first HUD row after the frame is drawn. If any terminal
+        # still auto-wrapped despite the margin, this guarantees the top line
+        # remains visible at row 1.
+        if header_lines:
+            sys.stdout.write("\033[1;1H" + vtrunc(str(header_lines[0]), draw_w).rstrip() + "\033[K")
+
         # Position cursor at the end of the visible text (after buffer)
         # Position cursor at end of visible buffer portion
         prompt_vlen = vlen(prompt_disp)
         buf_vlen = vlen(buf_to_show)
         cursor_col = prompt_vlen + buf_vlen + 1
         # Ensure cursor doesn't go off-screen
-        if cursor_col > term_w: cursor_col = term_w
+        if cursor_col > draw_w: cursor_col = draw_w
         sys.stdout.write(f"\033[{term_h};{cursor_col}H\033[?25h"); sys.stdout.flush()
 
 # ==================== TUTORIAL ====================
@@ -2684,6 +2793,7 @@ class Player:
                 elif self.temp > target:
                     self.temp = max(target, self.temp - TEMP_FOREST_DRIFT * dt)
             # Arctic cold damage — insulation-level system (campfire overrides)
+            self._cold_damaging = False
             if cur_biome_t == "Arctic" and not (self.resting and self.rest_mode == "campfire" and self.campfire_fuel > 0):
                 base_req = self.arctic_insulation_req
                 # Gradient: within 200 coords of border, insulation requirement is reduced
@@ -2694,6 +2804,7 @@ class Player:
                 effective_req = base_req * gradient_frac
                 deficit = max(0.0, effective_req - player_insulation)
                 if deficit > 0:
+                    self._cold_damaging = True
                     self.note_damage_cause("Hypothermia")
                     cold_rate = (TEMP_COLD_DMG_FULL / GAME_HOUR) * (deficit / max(1.0, effective_req)) * gradient_frac
                     self.health = max(0, self.health - cold_rate * dt)
@@ -2755,6 +2866,8 @@ class Player:
                         # Missed — reset catch window for another attempt
                         trap["catch_time"] = now + TRAP_CATCH_TIME
             for t in list(self.active_tasks):
+                if "paused_remaining" in t:
+                    continue
                 if now >= t["end"]:
                     self.inventory[t["item"]] = self.inventory.get(t["item"], 0) + 1
                     if t["item"] == "plank":
@@ -3529,30 +3642,29 @@ class World:
                     prey = None
                     prey_dist = float('inf')
                     for b in self.animals:
-                        if b is a or b["type"] == "grot":
-                            continue
-                        pd = math.hypot(b["x"]-a["x"], b["y"]-a["y"])
-                        if pd <= 6.0 and pd < prey_dist:
-                            prey = b
-                            prey_dist = pd
-                    if prey and prey_dist > 0.5 and prey_dist < dist_to_player:
-                        dx = (prey["x"] - a["x"]) / prey_dist
-                        dy = (prey["y"] - a["y"]) / prey_dist
-                        a["x"] += dx * real_speed
-                        a["y"] += dy * real_speed
-                        continue
-                # Grots may hunt nearby prey if it is closer than the player
-                if not a.get("fleeing"):
-                    prey = None
-                    prey_dist = float('inf')
-                    for b in self.animals:
                         if b is a or b.get("type") == "grot":
                             continue
+                        if b.get("hp", 1) <= 0:
+                            continue
                         pd = math.hypot(b["x"]-a["x"], b["y"]-a["y"])
-                        if pd <= 6.0 and pd < prey_dist:
+                        if pd <= 8.0 and pd < prey_dist:
                             prey = b
                             prey_dist = pd
-                    if prey and prey_dist > 0.5 and prey_dist < dist_to_player:
+                    if prey and prey_dist < dist_to_player:
+                        # Spook the prey
+                        prey["fleeing"] = True
+                        prey["_threat_pos"] = (a["x"], a["y"])
+                        if prey_dist <= 1.2:
+                            # Grot kills prey on contact
+                            prey["hp"] = 0
+                            try:
+                                idx_p = self.animals.index(prey)
+                                if idx_p not in to_remove:
+                                    to_remove.append(idx_p)
+                            except ValueError:
+                                pass
+                            # tiny pause / no movement this tick
+                            continue
                         dx = (prey["x"] - a["x"]) / prey_dist
                         dy = (prey["y"] - a["y"]) / prey_dist
                         a["x"] += dx * real_speed
@@ -3578,18 +3690,44 @@ class World:
                     a["x"] += random.uniform(-1,1) * real_speed * 0.1
                     a["y"] += random.uniform(-1,1) * real_speed * 0.1
                 continue  # Skip the generic flee/wander logic below for grots
+            # ---- Non-grot animal (prey) AI ----
+            # Find nearest grot threat; prey are afraid of grots too.
+            nearest_grot = None
+            nearest_grot_dist = float('inf')
+            for g in self.animals:
+                if g.get("type") != "grot" or g.get("hp", 0) <= 0:
+                    continue
+                gd = math.hypot(g["x"]-a["x"], g["y"]-a["y"])
+                if gd < nearest_grot_dist:
+                    nearest_grot_dist = gd
+                    nearest_grot = g
             if not a.get("fleeing"):
                 vm = a.get("vision_max", adef.get("vision_max", 5))
                 vp = a.get("vision_peak", adef.get("vision_peak", 3))
                 vision = random.triangular(0, vm, vp)
                 if dist_to_player < vision and dist_to_player > 0.1:
                     a["fleeing"] = True
+                elif nearest_grot is not None and nearest_grot_dist < max(vm, 6.0):
+                    a["fleeing"] = True
+                    a["_threat_pos"] = (nearest_grot["x"], nearest_grot["y"])
             if a.get("fleeing"):
-                if dist_to_player > FOG_RADIUS * 2:
+                # Flee from whichever threat is closer: player or known grot threat
+                threat_x, threat_y = player.x, player.y
+                threat_d = dist_to_player
+                tp = a.get("_threat_pos")
+                if tp is not None:
+                    td = math.hypot(a["x"]-tp[0], a["y"]-tp[1])
+                    if td < threat_d:
+                        threat_x, threat_y = tp
+                        threat_d = td
+                if nearest_grot is not None and nearest_grot_dist < threat_d:
+                    threat_x, threat_y = nearest_grot["x"], nearest_grot["y"]
+                    threat_d = nearest_grot_dist
+                if threat_d > FOG_RADIUS * 2 and dist_to_player > FOG_RADIUS * 2:
                     to_remove.append(i); continue
-                if dist_to_player > 0.1:
-                    dx = (a["x"]-player.x)/dist_to_player
-                    dy = (a["y"]-player.y)/dist_to_player
+                if threat_d > 0.1:
+                    dx = (a["x"]-threat_x)/threat_d
+                    dy = (a["y"]-threat_y)/threat_d
                     a["x"] += dx * real_speed
                     a["y"] += dy * real_speed
             else:
@@ -4100,6 +4238,11 @@ def start_turn_based_combat(player, world, attackers, msg):
         "player_first": player_first,
     }
     player.in_combat = True
+    # Pause any active crafting so combat doesn't tick it forward
+    now_pc = time.time()
+    for t in player.active_tasks:
+        if "paused_remaining" not in t:
+            t["paused_remaining"] = max(0, int(t["end"] - now_pc))
     msg.append(f"⚔️ Turn-based combat started! You face {len(enemies)} enemy(ies). AP per player segment: 5.\nYou will act {'first' if player_first else 'after enemies'}; player segments: {player_turns}, enemy segments: {enemy_segments}.")
     # Brief user-facing combat help (commands and short effects)
     msg.append("🛈 Combat commands: a/attack/s/strike — Strike (cost 3 AP). t/throw — Throw (cost 5 AP). block — Brace to block (cost 3 AP). flee — Attempt to flee (cost 2 AP, grants 5s safe window but enemies may hit once). pass/end — End your segment and let enemies act. status — Show combat status.")
@@ -4114,6 +4257,28 @@ def start_turn_based_combat(player, world, attackers, msg):
                     break
             if player.health <= 0:
                 break
+
+
+def _resume_paused_crafting(player):
+    """Resume any crafting that was paused when combat started."""
+    now = time.time()
+    for t in player.active_tasks:
+        if "paused_remaining" in t:
+            t["end"] = now + t["paused_remaining"]
+            del t["paused_remaining"]
+
+
+def _end_combat_if_clear(player, msg):
+    """If all enemies are defeated, exit combat and resume paused crafting."""
+    if not player.in_combat or not player.combat:
+        return False
+    if any(e["hp"] > 0 for e in player.combat.get("enemies", [])):
+        return False
+    msg.append("✅ All enemies defeated! Combat ended.")
+    _resume_paused_crafting(player)
+    player.in_combat = False
+    player.combat = None
+    return True
 
 
 def _enemy_attack_player(player, enemy, msg):
@@ -4196,12 +4361,7 @@ def handle_combat_command(player, world, act, arg, msg, term=None):
             return min(live, key=lambda ee: math.hypot(ee['ref']['x']-player.x, ee['ref']['y']-player.y))
     if not live:
         msg.append("✅ All enemies defeated!")
-        # Resume any paused crafting
-        now = time.time()
-        for t in player.active_tasks:
-            if "paused_remaining" in t:
-                t["end"] = now + t["paused_remaining"]
-                del t["paused_remaining"]
+        _resume_paused_crafting(player)
         player.in_combat = False; player.combat = None
         return True
 
@@ -4221,6 +4381,9 @@ def handle_combat_command(player, world, act, arg, msg, term=None):
         sdef = SPEAR_DEFS.get(player.spear_type, {})
         dmg = sdef.get("strike", 0) * (2 if player.inventory.get("poison",0)>0 else 1)
         target["hp"] -= dmg
+        # Sync HP back to world animal reference so damage persists across combats
+        try: target["ref"]["hp"] = target["hp"]
+        except Exception: pass
         player.spear_dur -= sdef.get("strike_cost", dmg)
         state["player_ap"] -= 3
         if player.inventory.get("poison",0)>0:
@@ -4237,7 +4400,8 @@ def handle_combat_command(player, world, act, arg, msg, term=None):
                 resolve_animal_kill(player, world, target["ref"], msg)
             except Exception:
                 pass
-            # remove from combat
+        # If all enemies are now defeated, exit combat immediately
+        _end_combat_if_clear(player, msg)
         return True
 
     # Throw - costs 5 AP (use existing throw logic if available)
@@ -4276,6 +4440,8 @@ def handle_combat_command(player, world, act, arg, msg, term=None):
             poison_mult = 2 if player.spear_poison_throw else 1
             dmg = max(1, int(sdef.get("throw", 0) * hit_mult * poison_mult))
             target["hp"] -= dmg
+            try: target["ref"]["hp"] = target["hp"]
+            except Exception: pass
             player.spear_dur -= min(sdef.get("throw_cost", 0), player.spear_dur)
             if player.spear_type == "ice_spear": player.spear_dur = 0
             if player.spear_poison_throw:
@@ -4291,6 +4457,7 @@ def handle_combat_command(player, world, act, arg, msg, term=None):
                 resolve_animal_kill(player, world, target["ref"], msg)
             except Exception:
                 pass
+        _end_combat_if_clear(player, msg)
         return True
 
     # Block - costs 3 AP
@@ -4309,6 +4476,7 @@ def handle_combat_command(player, world, act, arg, msg, term=None):
             msg.append("⚡ Not enough AP to flee (2).")
             return True
         state["player_ap"] -= 2
+        _resume_paused_crafting(player)
         player.in_combat = False
         player.combat = None
         player.flee_until = time.time() + 5.0
@@ -4325,13 +4493,17 @@ def handle_combat_command(player, world, act, arg, msg, term=None):
         state["blocking"] = False
         for e in [en for en in enemies if en["hp"]>0]:
             _enemy_attack_player(player, e, msg)
+        # If enemies were all defeated mid-pass, exit cleanly
+        if _end_combat_if_clear(player, msg):
+            return True
         # reset player AP for next player segment and decrement player_turns
         player.combat["player_turns"] -= 1
         if player.combat["player_turns"] <= 0:
             # combat rounds complete: re-evaluate initiatives for next cycle
+            _resume_paused_crafting(player)
             player.in_combat = False
             player.combat = None
-            msg.append("✅ All enemies defeated! Combat ended.")
+            msg.append("🏁 Combat ended.")
         else:
             player.combat["player_ap"] = 5
             msg.append(f"🔁 Next player segment: {player.combat['player_turns']} remaining.")
@@ -4392,42 +4564,62 @@ def eat_unknown_item(player, inv_key, msg):
         else:              msg.append("🤔 You ate the unknown item. You feel... odd.")
 
 def do_inspect_inventory(player, arg, msg, refresh_fn):
+    if getattr(player, "inspect_pending", None):
+        msg.append("⏳ Already inspecting — please wait."); return True
     found_key = find_unknown_inv_key(player, arg)
     if not found_key: return False
     inv_entry = player.inventory[found_key]
     if not inv_entry.get("items"):
         msg.append("❌ No items in that stack."); return True
     tries = inv_entry.get("inspect_tries", 0)
-
-    # --- PRE-CHECKS BEFORE any delay ---
     if tries >= MAX_INSPECTIONS:
         msg.append(f"⚠️ Max inspections reached ({MAX_INSPECTIONS}/{MAX_INSPECTIONS}). Cannot inspect further."); return True
     has_lens = player.inventory.get("id_lens", 0) > 0
     if not has_lens and player.energy < INSPECT_COST:
         msg.append(f"⚡ Not enough energy — need {INSPECT_COST}, have {int(player.energy)}. (Or buy an ID Lens)"); return True
-
-    # --- NOW start the timed inspection ---
-    msg.append("🔍 Inspecting... (3 seconds)"); refresh_fn(); time.sleep(INSPECT_TIME)
-    if has_lens:
-        player.inventory["id_lens"] -= 1
-        real = inv_entry["items"].pop(0)
-        inv_entry["qty"] -= 1
-        if inv_entry["qty"] <= 0: del player.inventory[found_key]
-        player.inventory[real] = player.inventory.get(real,0) + 1
-        msg.append(f"🔍 Lens used! It's {display_item_name(real)}.")
-    else:
-        player.energy -= INSPECT_COST
-        real = inv_entry["items"][0]
-        inv_entry["inspect_tries"] = tries + 1
-        chance = min(1.0, IDENTIFY_CHANCES.get(real,0.0) + player.inventory.get("textbook",0)*0.1)
-        if random.random() <= chance:
-            inv_entry["items"].pop(0); inv_entry["qty"] -= 1
-            if inv_entry["qty"] <= 0: del player.inventory[found_key]
-            player.inventory[real] = player.inventory.get(real,0) + 1
-            msg.append(f"✅ Identified! It's {display_item_name(real)}. ({inv_entry.get('inspect_tries',1)}/{MAX_INSPECTIONS})")
-        else:
-            msg.append(f"❌ Failed to identify. ({inv_entry.get('inspect_tries',1)}/{MAX_INSPECTIONS})")
+    # --- Schedule a non-blocking inspection ---
+    player.inspect_pending = {"kind": "inv", "key": found_key, "end": time.time() + INSPECT_TIME}
+    msg.append("🔍 Inspecting... (3 seconds)")
     return True
+
+def _finalize_inspect(player, world, msg):
+    ip = getattr(player, "inspect_pending", None)
+    if not ip or time.time() < ip["end"]:
+        return
+    if ip["kind"] == "inv":
+        key = ip["key"]
+        inv_entry = player.inventory.get(key)
+        if not inv_entry or not inv_entry.get("items"):
+            player.inspect_pending = None; return
+        has_lens = player.inventory.get("id_lens", 0) > 0
+        if has_lens:
+            player.inventory["id_lens"] -= 1
+            real = inv_entry["items"].pop(0)
+            inv_entry["qty"] -= 1
+            if inv_entry["qty"] <= 0: del player.inventory[key]
+            player.inventory[real] = player.inventory.get(real, 0) + 1
+            msg.append(f"🔍 Lens used! It's {display_item_name(real)}.")
+        else:
+            player.energy -= INSPECT_COST
+            real = inv_entry["items"][0]
+            tries = inv_entry.get("inspect_tries", 0)
+            inv_entry["inspect_tries"] = tries + 1
+            chance = min(1.0, IDENTIFY_CHANCES.get(real, 0.0) + player.inventory.get("textbook", 0) * 0.1)
+            if random.random() <= chance:
+                inv_entry["items"].pop(0); inv_entry["qty"] -= 1
+                if inv_entry["qty"] <= 0: del player.inventory[key]
+                player.inventory[real] = player.inventory.get(real, 0) + 1
+                msg.append(f"✅ Identified! It's {display_item_name(real)}. ({inv_entry.get('inspect_tries',1)}/{MAX_INSPECTIONS})")
+            else:
+                msg.append(f"❌ Failed to identify. ({inv_entry.get('inspect_tries',1)}/{MAX_INSPECTIONS})")
+    elif ip["kind"] == "cluster":
+        cx, cy = ip["cx"], ip["cy"]
+        cl = world.clusters.get((cx, cy))
+        if cl and not cl["is_identified"]:
+            ok, m = world.inspect_cluster(player, cl)
+            msg.append(m)
+    player.inspect_pending = None
+
 
 # ==================== CRAFTING HELPER ====================
 def resolve_any_berry(player, recipe):
@@ -4815,7 +5007,7 @@ def main():
         hdr = [
             f"{'🌙 NIGHT' if player.time_of_day=='night' else '☀️ DAY'} | 📍@({player.x},{player.y}) | {'🌲 Forest' if biome_at(player.x,player.y)=='Forest' else '❄️ Arctic'} | 🧭{'↗️' if dist_to_border(player.x,player.y)>0 else '↙️'}{abs(int(dist_to_border(player.x,player.y)))}",
             f"❤️{player.health:.0f} | 🍽️{player.hunger:.0f} | 💧{player.thirst:.0f} | ⚡{int(player.energy)} | 😴{int(player.fatigue)}",
-            f"🪙{player.coins:.0f} | 📚{player.inventory.get('textbook',0)} | {(weather.current if biome_at(player.x,player.y)=='Arctic' else ('☀️ CLEAR' if any(w in weather.current.upper() for w in ('ARCTIC', 'BLIZZARD', 'SNOW STORM', 'SNOWSTORM')) else weather.current)).upper()} | 🏆{int(player.points)}pts | {_temp_label(player.temp)}"
+            f"🪙{player.coins:.0f} | 📚{player.inventory.get('textbook',0)} | {(weather.current if biome_at(player.x,player.y)=='Arctic' else ('☀️ CLEAR' if any(w in weather.current.upper() for w in ('ARCTIC', 'BLIZZARD', 'SNOW STORM', 'SNOWSTORM')) else weather.current)).upper()} | 🏆{int(player.points)}pts | {_temp_label(player.temp, player)}"
         ]
         # Tool durabilities on line 2
         if has_adv_axe and player.axe_dur > 0:
@@ -4943,6 +5135,82 @@ def main():
     try:
         while not game_over:
             was_crafting = bool(player.active_tasks)
+            # ---- Async INSPECT finalization ----
+            if getattr(player, "inspect_pending", None) and not paused and not player.in_combat:
+                _finalize_inspect(player, world, msg)
+                msg = msg[-3:]
+            # ---- Async GATHER ALL finalization ----
+            ga = getattr(player, "gather_all", None)
+            if ga and not paused and not player.in_combat and time.time() >= ga["end"]:
+                gx, gy = ga["x"], ga["y"]
+                qty = ga["qty"]; energy_cost = ga["energy_cost"]
+                cl = world.clusters.get((gx, gy))
+                if not cl or cl.get("qty", 0) <= 0:
+                    msg.append("🔍 Gather all: nothing left to collect.")
+                    player.gather_all = None
+                else:
+                    real = cl["real_item"]
+                    if not cl["is_identified"]:
+                        cat = UNKNOWN_CATEGORY_MAP.get(real, "misc")
+                        inv_key, inv_entry = player.get_unknown_entry(cat)
+                        inv_entry["qty"] += qty; inv_entry["items"].extend([real] * qty)
+                        inv_entry["inspect_tries"] = max(inv_entry.get("inspect_tries", 0), cl.get("inspection_attempts", 0))
+                        disp = UNKNOWN_DISPLAY_MAP.get(cat, f"❓ Unknown {cat.title()}")
+                        msg.append(f"➕ {qty} {disp}")
+                    else:
+                        player.inventory[real] = player.inventory.get(real, 0) + qty
+                        msg.append(f"➕ {qty} {display_item_name(real)} (gathered all)")
+                    if real == "wood":
+                        player.wood_gathered += qty
+                        for _ in range(qty):
+                            used, brk = player.use_axe(1)
+                            if brk: msg.append(brk); break
+                    if real in BERRY_ITEMS: player.berries_gathered += qty
+                    if real in MUSHROOM_ITEMS: player.mushrooms_gathered += qty
+                    if real == "bee_hive": player.bee_hives_collected += qty
+                    if real == "spider_silk": player.spider_silk_gathered += qty
+                    if real == "rock":
+                        for _ in range(qty):
+                            used, brk = player.use_pickaxe(1)
+                            if brk: msg.append(brk); break
+                    if cl.get("meta", {}).get("hazard"):
+                        hk = cl["meta"].get("hazard_key"); h = HAZARDS.get(hk, {}); base_dmg = h.get("dmg", 0)
+                        hits = 0; blocked = 0; total_dmg = 0; broken = False
+                        for _ in range(qty):
+                            if random.random() < h.get("chance", 0.5):
+                                final_dmg = base_dmg
+                                if player.wearing:
+                                    reduction = player.armor_hazard_reduction(hk)
+                                    final_dmg = max(0, base_dmg - reduction)
+                                    if final_dmg < base_dmg:
+                                        player.armor_dur -= final_dmg
+                                        if player.armor_dur <= 0:
+                                            player.wearing = None
+                                            player.armor_dur = 0
+                                            broken = True
+                                if final_dmg > 0:
+                                    player.note_damage_cause(f"Hit by {hk.replace('_', ' ').title()}")
+                                    player.health -= final_dmg
+                                    total_dmg += final_dmg
+                                    hits += 1
+                                else:
+                                    blocked += 1
+                        if hits > 0:
+                            msg.append(f"💥 Hit by {hk.replace('_', ' ').title()} {hits} times! -{total_dmg} HP")
+                            flash_damage()
+                        elif blocked > 0:
+                            msg.append("🛡️ Attack blocked by armor!")
+                        if broken:
+                            msg.append("💥 Armor broke!")
+                    cl["qty"] = 0
+                    world.depleted.add((gx, gy))
+                    if (gx, gy) in world.clusters:
+                        del world.clusters[(gx, gy)]
+                    player.energy = max(0, player.energy - energy_cost)
+                    msg.append(f"✅ Gathering finished! Energy cost = {energy_cost}.")
+                    player.gather_all = None
+                msg = msg[-3:]
+
             if not paused:
                 res = player.update_passive()
                 unlocked = was_crafting and not player.active_tasks
@@ -5144,6 +5412,8 @@ def main():
                 if player.resting: player.resting = False; player.rest_mode = None
                 if player.active_tasks:
                     msg.append("🔨 Can't move while crafting! Wait for it to finish, or use the 'cancel' command."); msg = msg[-3:]; rn = True
+                elif getattr(player, "gather_all", None):
+                    msg.append("⏳ Can't move while gathering all. Wait for it to finish."); msg = msg[-3:]; rn = True
                 else:
                     dx = 1 if key=='RIGHT' else -1 if key=='LEFT' else 0
                     dy = 1 if key=='UP' else -1 if key=='DOWN' else 0
@@ -5474,8 +5744,11 @@ def main():
                                 elif player.inventory.get("id_lens",0) == 0 and player.energy < INSPECT_COST:
                                     msg.append(f"⚡ Not enough energy — need {INSPECT_COST}, have {int(player.energy)}.")
                                 else:
-                                    msg.append("🔍 Inspecting cluster... (3 seconds)"); refresh(); time.sleep(INSPECT_TIME)
-                                    ok, m = world.inspect_cluster(player, cl); msg.append(m)
+                                    if getattr(player, "inspect_pending", None):
+                                        msg.append("⏳ Already inspecting — please wait.")
+                                    else:
+                                        player.inspect_pending = {"kind": "cluster", "cx": int(player.x), "cy": int(player.y), "end": time.time() + INSPECT_TIME}
+                                        msg.append("🔍 Inspecting cluster... (3 seconds)")
                             elif cl and cl["is_identified"]:
                                 msg.append(f"✅ Already known: {cl['name']}.")
                             else:
@@ -5492,8 +5765,11 @@ def main():
                             elif player.inventory.get("id_lens",0) == 0 and player.energy < INSPECT_COST:
                                 msg.append(f"⚡ Not enough energy — need {INSPECT_COST}, have {int(player.energy)}.")
                             else:
-                                msg.append("🔍 Inspecting cluster... (3 seconds)"); refresh(); time.sleep(INSPECT_TIME)
-                                ok, m = world.inspect_cluster(player, cl); msg.append(m)
+                                if getattr(player, "inspect_pending", None):
+                                    msg.append("⏳ Already inspecting — please wait.")
+                                else:
+                                    player.inspect_pending = {"kind": "cluster", "cx": int(player.x), "cy": int(player.y), "end": time.time() + INSPECT_TIME}
+                                    msg.append("🔍 Inspecting cluster... (3 seconds)")
 
                 # ---- FIGHT OLD_MAN ----
                 elif act == "fight" and arg.strip().replace(" ","_").lower() == "old_man":
@@ -5652,6 +5928,8 @@ def main():
                         msg.append("⏸️ Can't gather while paused. Resume first."); msg = msg[-3:]; continue
                     if player.active_tasks:
                         msg.append("🔨 Can't gather while crafting! Wait for it to finish, or use the 'cancel' command."); msg = msg[-3:]; continue
+                    if getattr(player, "gather_all", None):
+                        msg.append("⏳ Already gathering all. Wait for it to finish."); msg = msg[-3:]; continue
                     if player.fatigue <= 0:
                         msg.append("😴 Too exhausted to gather! Type 'rest' to recover Fatigue."); continue
                     cl = world.clusters.get((int(player.x),int(player.y)))
@@ -5668,84 +5946,20 @@ def main():
                             article = "an" if tool_req[0] in "aeiou" else "a"
                             msg.append(f"🔒 Need {article} {tool_req} first"); continue
                     countdown_secs = math.ceil(qty / 2.0)
-                    msg.append(f"⏳ Gather all activated. ({countdown_secs}s)")
+                    # Schedule the gather-all as an async pending task so the player
+                    # can still use inventory/help/recipes/other read-only commands.
+                    player.gather_all = {
+                        "x": int(player.x),
+                        "y": int(player.y),
+                        "qty": qty,
+                        "energy_cost": energy_cost,
+                        "end": time.time() + countdown_secs,
+                        "total": countdown_secs,
+                    }
+                    msg.append(f"⏳ Gather all activated. ({countdown_secs}s — you can still type commands)")
                     msg = msg[-3:]
-                    refresh()
-                    countdown_end = time.time() + countdown_secs
-                    while time.time() < countdown_end:
-                        key = term.get_key()
-                        if key:
-                            if key == "ENTER":
-                                buf = ""
-                            elif key == "BACKSPACE":
-                                buf = buf[:-1]
-                            elif len(key) == 1:
-                                buf += key
-                        remaining = max(0, int(countdown_end - time.time()))
-                        msg[-1] = f"⏳ Gather all activated. {remaining}..."
-                        msg = msg[-3:]
-                        refresh()
-                        time.sleep(0.05)
-                    real = cl["real_item"]
-                    if not cl["is_identified"]:
-                        cat = UNKNOWN_CATEGORY_MAP.get(real, "misc")
-                        inv_key, inv_entry = player.get_unknown_entry(cat)
-                        inv_entry["qty"] += qty; inv_entry["items"].extend([real] * qty)
-                        inv_entry["inspect_tries"] = max(inv_entry.get("inspect_tries", 0), cl.get("inspection_attempts", 0))
-                        disp = UNKNOWN_DISPLAY_MAP.get(cat, f"❓ Unknown {cat.title()}")
-                        msg.append(f"➕ {qty} {disp}")
-                    else:
-                        player.inventory[real] = player.inventory.get(real, 0) + qty
-                        msg.append(f"➕ {qty} {display_item_name(real)} (gathered all)")
-                    if real == "wood":
-                        player.wood_gathered += qty
-                        for _ in range(qty):
-                            used, brk = player.use_axe(1)
-                            if brk: msg.append(brk); break
-                    if real in BERRY_ITEMS: player.berries_gathered += qty
-                    if real in MUSHROOM_ITEMS: player.mushrooms_gathered += qty
-                    if real == "bee_hive": player.bee_hives_collected += qty
-                    if real == "spider_silk": player.spider_silk_gathered += qty
-                    if real == "rock":
-                        for _ in range(qty):
-                            used, brk = player.use_pickaxe(1)
-                            if brk: msg.append(brk); break
-                    if cl.get("meta", {}).get("hazard"):
-                        hk = cl["meta"].get("hazard_key"); h = HAZARDS.get(hk, {}); base_dmg = h.get("dmg", 0)
-                        hits = 0; blocked = 0; total_dmg = 0; broken = False
-                        for _ in range(qty):
-                            if random.random() < h.get("chance", 0.5):
-                                final_dmg = base_dmg
-                                if player.wearing:
-                                    reduction = player.armor_hazard_reduction(hk)
-                                    final_dmg = max(0, base_dmg - reduction)
-                                    if final_dmg < base_dmg:
-                                        player.armor_dur -= final_dmg
-                                        if player.armor_dur <= 0:
-                                            player.wearing = None
-                                            player.armor_dur = 0
-                                            broken = True
-                                if final_dmg > 0:
-                                    player.note_damage_cause(f"Hit by {hk.replace('_', ' ').title()}")
-                                    player.health -= final_dmg
-                                    total_dmg += final_dmg
-                                    hits += 1
-                                else:
-                                    blocked += 1
-                        if hits > 0:
-                            msg.append(f"💥 Hit by {hk.replace('_', ' ').title()} {hits} times! -{total_dmg} HP")
-                            flash_damage()
-                        elif blocked > 0:
-                            msg.append("🛡️ Attack blocked by armor!")
-                        if broken:
-                            msg.append("💥 Armor broke!")
-                    cl["qty"] = 0
-                    world.depleted.add((int(player.x), int(player.y)))
-                    if (int(player.x), int(player.y)) in world.clusters:
-                        del world.clusters[(int(player.x), int(player.y))]
-                    player.energy = max(0, player.energy - energy_cost)
-                    msg.append(f"✅ Gathering finished! Energy cost = {energy_cost}.")
-                    msg = msg[-3:]
+                    rn = True
+
 
                 # ---- GATHER ----
                 elif act == "gather":
